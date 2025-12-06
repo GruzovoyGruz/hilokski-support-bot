@@ -1,0 +1,157 @@
+import asyncio
+import logging
+import re
+import os
+from datetime import datetime
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.enums import ParseMode
+
+# === ПОЛУЧАЕМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+pending_messages = {}
+
+# === СЛОВАРИ РАСПОЗНАВАНИЯ ===
+TRUCK_BRANDS = ["kamaz", "volvo", "scania", "mercedes", "man", "daf", "iveco", "maz", "gaz", "ural", "krone", "freightliner", "peterbilt"]
+ENGINE_KEYWORDS = ["cummins", "d13", "d16", "x15", "ямз", "yamz", "isb", "deutz", "ммз"]
+TRANSMISSION_KEYWORDS = ["zf", "allison", "eaton", "маз", "ямз", "коробка", "кпп"]
+
+def extract_vehicle_info(text: str):
+    if not text: return {"truck": None, "engine": None, "transmission": None, "phone": None}
+    info = {"truck": None, "engine": None, "transmission": None, "phone": None}
+    text_clean = re.sub(r'[^\w\s+78()\-]', ' ', text)
+    text_lower = text.lower()
+
+    # Телефон
+    phone_match = re.search(r'(\+?7|8)?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}', text_clean)
+    if phone_match:
+        digits = re.sub(r'\D', '', phone_match.group())
+        if len(digits) in (10, 11):
+            info["phone"] = digits[-10:]
+
+    # Грузовик
+    for brand in TRUCK_BRANDS:
+        if brand in text_lower:
+            pattern = rf'\b{brand}\s+[\w\d\-]+'
+            match = re.search(pattern, text, re.IGNORECASE)
+            info["truck"] = (match.group().strip() if match else brand.upper())
+            break
+
+    # Двигатель
+    for kw in ENGINE_KEYWORDS:
+        if kw in text_lower:
+            pattern = rf'\b{kw}[^\.\,\;\n]*'
+            match = re.search(pattern, text, re.IGNORECASE)
+            info["engine"] = match.group().strip() if match else kw.upper()
+            break
+
+    # КПП
+    for kw in TRANSMISSION_KEYWORDS:
+        if kw in text_lower:
+            pattern = rf'\b{kw}[^\.\,\;\n]*'
+            match = re.search(pattern, text, re.IGNORECASE)
+            info["transmission"] = match.group().strip() if match else kw.upper()
+            break
+
+    return info
+
+def format_vehicle_info(info: dict) -> str:
+    parts = []
+    if info["truck"]: parts.append(f"🚛 <b>Грузовик:</b> {info['truck']}")
+    if info["engine"]: parts.append(f"⚙️ <b>Двигатель:</b> {info['engine']}")
+    if info["transmission"]: parts.append(f"🔄 <b>КПП:</b> {info['transmission']}")
+    if info["phone"]: parts.append(f"📞 <b>Телефон:</b> +7{info['phone']}")
+    return "\n".join(parts) + "\n" if parts else ""
+
+def get_user_display(user) -> str:
+    parts = []
+    if user.username: parts.append(f"@{user.username}")
+    if user.first_name or user.last_name:
+        name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+        if name: parts.append(name)
+    return " | ".join(parts) if parts else f"ID: {user.id}"
+
+async def delayed_forward(user_id: int):
+    await asyncio.sleep(600)  # 10 минут
+    data = pending_messages.get(user_id)
+    if not 
+        return
+    message = data["message"]
+    client_info = get_user_display(message.from_user)
+    text_for_parse = (message.text or message.caption or "")
+    vehicle_info = extract_vehicle_info(text_for_parse)
+    vehicle_block = format_vehicle_info(vehicle_info)
+
+    caption = (
+        f"📬 <b>Новое сообщение от клиента</b>\n"
+        f"👤 <b>Клиент:</b> {client_info}\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"📅 <b>Время:</b> {message.date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"{vehicle_block}"
+        f"────────────────────\n"
+    )
+
+    try:
+        if message.text:
+            caption += f"<b>Текст:</b>\n{message.text}"
+            await bot.send_message(GROUP_CHAT_ID, caption)
+        elif message.photo:
+            await bot.send_photo(GROUP_CHAT_ID, message.photo[-1].file_id, caption=caption)
+        elif message.video:
+            await bot.send_video(GROUP_CHAT_ID, message.video.file_id, caption=caption)
+        elif message.document:
+            await bot.send_document(GROUP_CHAT_ID, message.document.file_id, caption=caption)
+        elif message.voice:
+            await bot.send_message(GROUP_CHAT_ID, caption + "<b>Голосовое сообщение</b>")
+            await bot.send_voice(GROUP_CHAT_ID, message.voice.file_id)
+        elif message.sticker:
+            await bot.send_message(GROUP_CHAT_ID, caption + "<b>Стикер</b>")
+            await bot.send_sticker(GROUP_CHAT_ID, message.sticker.file_id)
+        else:
+            await bot.send_message(GROUP_CHAT_ID, caption + "<b>Неизвестный тип сообщения</b>")
+    except Exception as e:
+        logging.error(f"Ошибка пересылки: {e}")
+
+    pending_messages.pop(user_id, None)
+
+@dp.message()
+async def handle_message(message: Message):
+    if message.chat.type != "private" or message.from_user.is_bot:
+        return
+    user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        if message.reply_to_message:
+            original_user_id = message.reply_to_message.from_user.id
+            pending_messages.pop(original_user_id, None)
+        return
+    pending_messages[user_id] = {"message": message}
+    await message.answer("✅ Сообщение получено. Ожидайте ответа от оператора.")
+    asyncio.create_task(delayed_forward(user_id))
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! 🚛\n"
+        "Опишите проблему и укажите:\n"
+        "• Марку грузовика (KAMAZ, Volvo и т.д.)\n"
+        "• Модель двигателя\n"
+        "• Модель КПП\n"
+        "• Номер телефона\n\n"
+        "Ответим в ближайшее время!"
+    )
+
+async def main():
+    if not BOT_TOKEN or not GROUP_CHAT_ID:
+        logging.error("❌ Не заданы BOT_TOKEN или GROUP_CHAT_ID")
+        return
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
